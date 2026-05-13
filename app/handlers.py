@@ -287,7 +287,7 @@ async def _run_attributes(
 
     for i, face in enumerate(faces):
         pict = draw.draw_boxes_on_image(
-            image, faces, highlight_index=i, colors=[(64, 64, 255)] * len(faces)
+            image, [face], highlight_index=0, colors=[(64, 64, 255)]
         )
         cap = f"👤 Лицо {i + 1} / {len(faces)}\n\n" + luna.format_face_attributes(face)
         await send_image_bytes(
@@ -326,7 +326,7 @@ async def _run_body_attributes(
 
     for i, body in enumerate(bodies):
         pict = draw.draw_boxes_on_image(
-            image, bodies, highlight_index=i, colors=[(0, 200, 140)] * len(bodies)
+            image, [body], highlight_index=0, colors=[(0, 200, 140)]
         )
         cap = f"🧍 Тело {i + 1} / {len(bodies)}\n\n" + luna.format_body_attributes(body)
         await send_image_bytes(
@@ -475,21 +475,22 @@ async def _run_face_detect(
         await _reply_menu("✅ Готово.", target)
         return
 
-    pict = draw.draw_boxes_on_image(
-        image,
-        faces,
-        highlight_index=None,
-        colors=[(255, 60, 60), (60, 180, 255), (80, 220, 120), (255, 180, 40), (200, 80, 255)],
-        line_width=3,
-    )
-    cap = f"👥 Детекция лиц: найдено {len(faces)}."
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=pict,
-        caption=cap,
-        filename="faces_detect.jpg",
-    )
+    for i, face in enumerate(faces):
+        pict = draw.draw_boxes_on_image(
+            image,
+            [face],
+            highlight_index=0,
+            colors=[(255, 60, 60)],
+            line_width=3,
+        )
+        cap = f"👥 Детекция лиц — лицо {i + 1} из {len(faces)}."
+        await send_image_bytes(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            image_bytes=pict,
+            caption=cap,
+            filename=f"face_detect_{i+1}.jpg",
+        )
     await _reply_menu("✅ Готово.", target)
 
 
@@ -518,21 +519,22 @@ async def _run_body_detect(
         await _reply_menu("✅ Готово.", target)
         return
 
-    pict = draw.draw_boxes_on_image(
-        image,
-        bodies,
-        highlight_index=None,
-        colors=[(0, 200, 140), (40, 140, 255), (200, 200, 60), (180, 100, 255), (255, 120, 80)],
-        line_width=3,
-    )
-    cap = f"🧍 Детекция тел: найдено {len(bodies)}."
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=pict,
-        caption=cap,
-        filename="bodies_detect.jpg",
-    )
+    for i, body in enumerate(bodies):
+        pict = draw.draw_boxes_on_image(
+            image,
+            [body],
+            highlight_index=0,
+            colors=[(0, 200, 140)],
+            line_width=3,
+        )
+        cap = f"🧍 Детекция тел — тело {i + 1} из {len(bodies)}."
+        await send_image_bytes(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            image_bytes=pict,
+            caption=cap,
+            filename=f"body_detect_{i+1}.jpg",
+        )
     await _reply_menu("✅ Готово.", target)
 
 
@@ -632,7 +634,7 @@ async def handle_update(update: dict[str, Any]) -> None:
         await send_text(
             login=target.get("login"),
             chat_id=target.get("chat_id"),
-            text="Атрибуты. Отправьте одно фото или ссылку — обработаю все найденные лица.",
+            text="Атрибуты. Отправьте одно фото или ссылку — по каждому лицу отдельная сводка и контур только этого лица.",
         )
         return
     if act == "flow_body_attributes":
@@ -640,7 +642,7 @@ async def handle_update(update: dict[str, Any]) -> None:
         await send_text(
             login=target.get("login"),
             chat_id=target.get("chat_id"),
-            text="Атрибуты тела. Отправьте одно фото или ссылку — обработаю все найденные тела.",
+            text="Атрибуты тела. Отправьте одно фото или ссылку — по каждому телу отдельная сводка и контур только этого тела.",
         )
         return
     if act == "flow_liveness":
@@ -672,7 +674,7 @@ async def handle_update(update: dict[str, Any]) -> None:
         await send_text(
             login=target.get("login"),
             chat_id=target.get("chat_id"),
-            text="Детекция лиц. Пришлите фото или ссылку — отмечу все найденные лица.",
+            text="Детекция лиц. Пришлите фото или ссылку — по каждому лицу отдельное фото с контуром только этого лица.",
         )
         return
     if act == "flow_body_detect":
@@ -680,7 +682,7 @@ async def handle_update(update: dict[str, Any]) -> None:
         await send_text(
             login=target.get("login"),
             chat_id=target.get("chat_id"),
-            text="Детекция тел. Пришлите фото или ссылку — отмечу все найденные тела.",
+            text="Детекция тел. Пришлите фото или ссылку — по каждому телу отдельное фото с контуром только этого тела.",
         )
         return
     if act == "flow_image_modification":

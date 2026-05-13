@@ -310,9 +310,30 @@ def format_deepfake(face: dict[str, Any]) -> str:
     return "\n".join(lines) if lines else json.dumps(df, ensure_ascii=False, indent=2)
 
 
+def _face_bbox_size(face: dict[str, Any]) -> dict[str, int] | None:
+    """Геометрия лица из detection.rect (размер области детекции в пикселях относительно кадра SDK)."""
+    det = face.get("detection") or {}
+    r = det.get("rect")
+    if not isinstance(r, dict):
+        return None
+    try:
+        w = int(r["width"])
+        h = int(r["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"width_px": w, "height_px": h, "area_px2": w * h}
+
+
 def format_face_attributes(face: dict[str, Any]) -> str:
     attrs = _annotate_estimations(_without_iris_landmarks(_face_attrs(face)))
-    parts = {
+    parts: dict[str, Any] = {}
+    size = _face_bbox_size(face)
+    if size is not None:
+        parts["📐 размер лица (bbox)"] = size
+    parts.update(
+        {
         "👄 mouth_attributes": attrs.get("mouth_attributes"),
         "👀 eyes_attributes": attrs.get("eyes_attributes"),
         "🙂 emotions": attrs.get("emotions"),
@@ -321,7 +342,7 @@ def format_face_attributes(face: dict[str, Any]) -> str:
         "👓 glasses": attrs.get("glasses"),
         "🪪 basic_attributes": attrs.get("basic_attributes"),
         "🎭 deepfake": attrs.get("deepfake"),
-    }
+        })
     occ = attrs.get("face_occlusion")
     if occ is not None:
         parts["🚫 face_occlusion"] = occ
