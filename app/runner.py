@@ -5,6 +5,7 @@ import logging
 import signal
 from pathlib import Path
 
+from app.access_control import ensure_bootstrap
 from app.config import settings
 from app.handlers import handle_update
 from app.yandex_api import get_updates
@@ -29,6 +30,16 @@ async def poll_loop(stop: asyncio.Event) -> None:
         raise SystemExit("Задайте YANDEX_BOT_TOKEN в окружении или .env")
 
     path = Path(settings.yandex_offset_file)
+    log.info(
+        "старт: BOT_AUTH_ENABLED=%s BOT_ACCESS_STORE=%s",
+        settings.bot_auth_enabled,
+        Path(settings.bot_access_store_path).resolve(),
+    )
+    try:
+        ensure_bootstrap()
+    except Exception:
+        log.exception("ensure_bootstrap")
+        raise
     offset = _read_offset(path)
     log.info("Yandex getUpdates: старт, offset=%s", offset)
 

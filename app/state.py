@@ -22,6 +22,7 @@ class Flow(Enum):
 class Session:
     flow: Flow = Flow.IDLE
     compare_buffers: list[tuple[bytes, str]] = field(default_factory=list)
+    authorized: bool = False
 
 
 _sessions: dict[str, Session] = {}

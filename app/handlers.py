@@ -4,6 +4,8 @@ import logging
 from collections import deque
 from typing import Any
 
+from app import access_control
+from app.config import settings
 from app import luna, draw
 from app.state import Flow, get_session, session_key
 from app.url_images import extract_urls, fetch_image_from_url
@@ -107,6 +109,69 @@ CROWD_DETECT_PARAMS: dict[str, int | float] = {
     "estimate_people_count": 1,
     "people_count_coordinates": 1,
 }
+
+
+def _principal(update: dict[str, Any]) -> str | None:
+    """Идентификатор пользователя для пароля: login, иначе id из from."""
+    from_ = update.get("from") or {}
+    login = from_.get("login")
+    if isinstance(login, str) and login.strip():
+        return login.strip().lower()
+    uid = from_.get("id")
+    if uid is not None and str(uid).strip():
+        return f"id:{uid}"
+    return None
+
+
+async def _admin_text_commands(
+    target: dict[str, str | None],
+    raw_text: str,
+    principal: str,
+) -> bool:
+    if principal not in access_control.admin_logins():
+        return False
+    t = raw_text.strip()
+    low = t.lower()
+    if low in ("!users", "/users"):
+        users = access_control.list_user_logins()
+        body = "Пользователи с доступом:\n" + (
+            "\n".join(f"• {u}" for u in users) if users else "(пока никого)"
+        )
+        await send_text(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            text=body[:5900],
+        )
+        return True
+    revoked = access_control.parse_admin_revoke(t)
+    if revoked:
+        if access_control.delete_user(revoked):
+            await send_text(
+                login=target.get("login"),
+                chat_id=target.get("chat_id"),
+                text=f"Доступ для `{revoked}` отозван.",
+            )
+        else:
+            await send_text(
+                login=target.get("login"),
+                chat_id=target.get("chat_id"),
+                text=f"Логин `{revoked}` не найден в списке.",
+            )
+        return True
+    issue_login = access_control.parse_admin_issue(t)
+    if issue_login:
+        pw = access_control.generate_password()
+        access_control.set_user_password(issue_login, pw)
+        await send_text(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            text=(
+                f"Пароль для пользователя `{issue_login}`:\n{pw}\n\n"
+                "Передайте его по защищённому каналу; повторно тот же текст бот не пришлёт."
+            )[:5900],
+        )
+        return True
+    return False
 
 
 def _target(update: dict[str, Any]) -> dict[str, str | None]:
@@ -612,12 +677,87 @@ async def handle_update(update: dict[str, Any]) -> None:
         return
 
     from_ = update.get("from") or {}
+    from_login = from_.get("login")
+    if not from_login and from_.get("id") is not None:
+        from_login = f"id:{from_.get('id')}"
     sk = session_key(
         (update.get("chat") or {}).get("type"),
         (update.get("chat") or {}).get("id"),
-        from_.get("login"),
+        from_login,
     )
     sess = get_session(sk)
+
+    raw_text = (update.get("text") or "").strip()
+
+    if settings.bot_auth_enabled:
+        pr = _principal(update)
+        if not pr:
+            await send_text(
+                login=target.get("login"),
+                chat_id=target.get("chat_id"),
+                text="Не удалось сопоставить профиль (нет логина или id в событии). Включите корпоративный аккаунт или обратитесь к администратору.",
+            )
+            return
+        if not access_control.user_has_record(pr):
+            await send_text(
+                login=target.get("login"),
+                chat_id=target.get("chat_id"),
+                text=(
+                    f"Доступ не настроен для учётной записи `{pr}`.\n\n"
+                    "Админ может выдать пароль командой "
+                    f"`!issue {pr}` (логин должен совпадать с вашим в мессенджере).\n\n"
+                    "Если вы админ: в `BOT_ADMIN_LOGINS` и в JSON должен быть **тот же** логин, "
+                    "что выше (как в Яндекс Мессенджере). Проверьте `.env` без пробелов в начале строк, "
+                    "`BOT_BOOTSTRAP_ADMIN_PASSWORD`, перезапустите бота — при старте создаются записи "
+                    "для всех логинов из `BOT_ADMIN_LOGINS`."
+                )[:5900],
+            )
+            return
+        if not sess.authorized:
+            act_early, _ = _extract_server_action(update)
+            if act_early:
+                await send_text(
+                    login=target.get("login"),
+                    chat_id=target.get("chat_id"),
+                    text="Сначала введите пароль доступа обычным текстом (без кнопок меню и без вложений).",
+                )
+                return
+            if _gallery_file_ids(update) or extract_urls(raw_text):
+                await send_text(
+                    login=target.get("login"),
+                    chat_id=target.get("chat_id"),
+                    text="Сначала введите пароль одним текстовым сообщением, без фото и без ссылок.",
+                )
+                return
+            if not raw_text:
+                return
+            if access_control.verify_password(pr, raw_text):
+                sess.authorized = True
+                await _reply_menu("✅ Вход выполнён.", target)
+                return
+            await send_text(
+                login=target.get("login"),
+                chat_id=target.get("chat_id"),
+                text="Неверный пароль.",
+            )
+            return
+
+    if settings.bot_auth_enabled and sess.authorized:
+        pr_a = _principal(update)
+        if pr_a:
+            low = raw_text.lower()
+            if low in ("!logout", "/logout"):
+                sess.authorized = False
+                sess.flow = Flow.IDLE
+                sess.compare_buffers = []
+                await send_text(
+                    login=target.get("login"),
+                    chat_id=target.get("chat_id"),
+                    text="Вы вышли. Введите пароль снова для входа.",
+                )
+                return
+            if await _admin_text_commands(target, raw_text, pr_a):
+                return
 
     act, _payload = _extract_server_action(update)
     if act == "flow_compare":
@@ -707,7 +847,6 @@ async def handle_update(update: dict[str, Any]) -> None:
         await _reply_menu("♻️ Состояние сброшено.", target)
         return
 
-    raw_text = (update.get("text") or "").strip()
     text = raw_text.lower()
     if text in ("/start", "/menu", "меню", "start"):
         sess.flow = Flow.IDLE

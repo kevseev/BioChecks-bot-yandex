@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 data/
+# пароли пользователей бота (копия с хоста в Docker)
+access_users.json
+# Docker: реальный файл паролей (пример — access_auth/access_users.example.json)
+access_auth/access_users.json

@@ -5,8 +5,11 @@ services:
     env_file: .env
     environment:
       YANDEX_OFFSET_FILE: /data/yandex_updates_offset.txt
+      # JSON с паролями с хоста: каталог ./access_auth (не файл — иначе Docker создаёт папку вместо файла)
+      BOT_ACCESS_STORE: /data/access_auth/access_users.json
     volumes:
       - bot_state:/data
+      - ./access_auth:/data/access_auth
     # Luna на хосте: в .env укажите LUNA_BASE_URL=http://host.docker.internal:5000/6
     extra_hosts:
       - "host.docker.internal:host-gateway"
