@@ -109,43 +109,6 @@ async def check_iso(
     return r.json()
 
 
-def format_iso_check_ru(iso_json: dict[str, Any]) -> str:
-    """Текст по ответу POST /iso (checkISO). См. docs.visionlabs.ru v.5.152.0, tag iso."""
-    lines: list[str] = ["📋 ISO/IEC 19794-5 (POST /iso, checkISO, multiface_policy=2)"]
-
-    if iso_json.get("ok") is False:
-        err = iso_json.get("error") or iso_json.get("message") or iso_json
-        lines.append(f"Ответ API: {err}")
-        return "\n".join(lines)[:5900]
-
-    # Частый путь — как у /sdk: images_estimations[].estimations[].face
-    imgs = iso_json.get("images_estimations") or iso_json.get("images") or []
-    chunks: list[str] = []
-    for ii, img in enumerate(imgs):
-        for ei, est in enumerate(img.get("estimations") or []):
-            face = est.get("face") if isinstance(est.get("face"), dict) else {}
-            est_d = est if isinstance(est, dict) else {}
-            blocks: list[dict[str, Any]] = []
-            for key in ("iso", "iso_checks", "iso_attributes", "standard", "checks"):
-                b = face.get(key) if isinstance(face.get(key), dict) else None
-                if not b and isinstance(est_d.get(key), dict):
-                    b = est_d[key]
-                if isinstance(b, dict) and b:
-                    blocks.append(b)
-            if blocks:
-                chunks.append(f"— кадр {ii + 1}, лицо {ei + 1} —\n" + json.dumps(blocks[0], ensure_ascii=False, indent=2))
-            elif face and any(k in face for k in ("verdict", "checks", "iso")):
-                chunks.append(json.dumps(face, ensure_ascii=False, indent=2)[:3500])
-
-    if chunks:
-        lines.append("\n\n".join(chunks))
-    else:
-        lines.append(json.dumps(iso_json, ensure_ascii=False, indent=2)[:5200])
-
-    text = "\n".join(lines)
-    return text[:5900]
-
-
 def pick_original_file_id(image_variants: list[dict[str, Any]]) -> str | None:
     """Берём оригинал (обычно последний вариант с name/size)."""
     if not image_variants:
@@ -324,6 +287,24 @@ _VALUE_HINTS: dict[str, dict[str, str]] = {
         "fake": "дипфейк/подделка",
     },
 }
+
+
+def _eyes_attributes_compact_for_caption(raw: dict[str, Any]) -> dict[str, Any]:
+    """Только состояние глаз со скобкой-переводом, порядок: правый, левый (как в выдаче операторов)."""
+    hints = _VALUE_HINTS.get("state", {})
+    out: dict[str, Any] = {}
+    for side in ("right_eye", "left_eye"):
+        block = raw.get(side)
+        if not isinstance(block, dict):
+            continue
+        st = block.get("state")
+        if isinstance(st, str):
+            hint = hints.get(st.lower())
+            label = f"{st} ({hint})" if hint else st
+            out[side] = {"state": label}
+        elif st is not None:
+            out[side] = {"state": st}
+    return out
 
 
 def _annotate_estimations(obj: Any) -> Any:
@@ -616,17 +597,22 @@ def format_face_attributes(
             "iris": "по iris_landmarks",
             "landmarks": "по меткам лица (68-point)",
         }[src]
-        parts["📏 расстояние между глазами"] = {"distance_px": round(dist, 2), "источник": hint}
+        parts["📏 расстояние между глазами"] = {"distance_px": float(round(dist, 2)), "источник": hint}
+    eyes_raw = attrs.get("eyes_attributes")
+    eyes_out: Any
+    if isinstance(eyes_raw, dict):
+        compact = _eyes_attributes_compact_for_caption(eyes_raw)
+        eyes_out = compact if compact else _annotate_estimations(eyes_raw)
+    else:
+        eyes_out = eyes_raw
     parts.update(
         {
         "👄 mouth_attributes": attrs.get("mouth_attributes"),
-        "👀 eyes_attributes": attrs.get("eyes_attributes"),
+        "👀 eyes_attributes": eyes_out,
         "🙂 emotions": attrs.get("emotions"),
         "😷 mask": attrs.get("mask"),
         "🧭 head_pose": attrs.get("head_pose"),
         "👓 glasses": attrs.get("glasses"),
-        "🪪 basic_attributes": attrs.get("basic_attributes"),
-        "🎭 deepfake": attrs.get("deepfake"),
         })
     occ = attrs.get("face_occlusion")
     if occ is not None:

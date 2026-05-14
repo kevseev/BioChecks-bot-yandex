@@ -41,7 +41,6 @@ ATTR_PARAMS: dict[str, int | float] = {
     "estimate_eyes_attributes": 1,
     "estimate_mouth_attributes": 1,
     "estimate_face_occlusion": 1,
-    "estimate_deepfake": 1,
     "score_threshold": 0.5,
 }
 
@@ -356,12 +355,10 @@ async def _run_attributes(
         return
 
     iso_payload: dict[str, Any] | None = None
-    iso_text: str | None = None
     if isinstance(iso_exc, Exception):
         log.warning("check_iso: %s", iso_exc)
     else:
         iso_payload = iso_exc
-        iso_text = luna.format_iso_check_ru(iso_exc)
 
     faces = luna.iter_faces_from_sdk(j)
     if not faces:
@@ -371,13 +368,6 @@ async def _run_attributes(
             text="👤 Лица не обнаружены.",
         )
         return
-
-    if iso_text:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=iso_text[:5900],
-        )
 
     for i, face in enumerate(faces):
         pict = draw.draw_boxes_on_image(
