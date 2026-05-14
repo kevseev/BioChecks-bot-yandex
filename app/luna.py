@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from typing import Any
@@ -74,6 +75,75 @@ async def matcher_raw_sdk(
         )
     r.raise_for_status()
     return r.json()
+
+
+async def check_iso(
+    image_bytes: bytes,
+    content_type: str,
+    *,
+    multiface_policy: int = 2,
+) -> dict[str, Any]:
+    """POST /iso — операция checkISO (ISO/IEC 19794-5).
+
+    Документация: https://docs.visionlabs.ru/luna/v.5.152.0/ReferenceManuals/APIReferenceManual.html#tag/iso/operation/checkISO
+    Параметр multiface_policy=2 — несколько лиц на кадре; расстояние между глазами — элемент проверки
+    ``eye_distance`` (поле ``object_value``, пиксели) в ``face.detection.iso.checks``.
+    """
+    base = settings.luna_base_url.rstrip("/")
+    url = f"{base}/iso"
+    params: dict[str, Any] = {"multiface_policy": multiface_policy}
+    headers = {**_luna_headers(), "Content-Type": content_type}
+    auth = (
+        (settings.luna_http_user, settings.luna_http_password)
+        if settings.luna_http_user and not settings.luna_bearer_token
+        else None
+    )
+    async with httpx.AsyncClient(auth=auth, timeout=httpx.Timeout(120.0)) as client:
+        r = await client.post(
+            url,
+            content=image_bytes,
+            headers=headers,
+            params=params,
+        )
+    r.raise_for_status()
+    return r.json()
+
+
+def format_iso_check_ru(iso_json: dict[str, Any]) -> str:
+    """Текст по ответу POST /iso (checkISO). См. docs.visionlabs.ru v.5.152.0, tag iso."""
+    lines: list[str] = ["📋 ISO/IEC 19794-5 (POST /iso, checkISO, multiface_policy=2)"]
+
+    if iso_json.get("ok") is False:
+        err = iso_json.get("error") or iso_json.get("message") or iso_json
+        lines.append(f"Ответ API: {err}")
+        return "\n".join(lines)[:5900]
+
+    # Частый путь — как у /sdk: images_estimations[].estimations[].face
+    imgs = iso_json.get("images_estimations") or iso_json.get("images") or []
+    chunks: list[str] = []
+    for ii, img in enumerate(imgs):
+        for ei, est in enumerate(img.get("estimations") or []):
+            face = est.get("face") if isinstance(est.get("face"), dict) else {}
+            est_d = est if isinstance(est, dict) else {}
+            blocks: list[dict[str, Any]] = []
+            for key in ("iso", "iso_checks", "iso_attributes", "standard", "checks"):
+                b = face.get(key) if isinstance(face.get(key), dict) else None
+                if not b and isinstance(est_d.get(key), dict):
+                    b = est_d[key]
+                if isinstance(b, dict) and b:
+                    blocks.append(b)
+            if blocks:
+                chunks.append(f"— кадр {ii + 1}, лицо {ei + 1} —\n" + json.dumps(blocks[0], ensure_ascii=False, indent=2))
+            elif face and any(k in face for k in ("verdict", "checks", "iso")):
+                chunks.append(json.dumps(face, ensure_ascii=False, indent=2)[:3500])
+
+    if chunks:
+        lines.append("\n\n".join(chunks))
+    else:
+        lines.append(json.dumps(iso_json, ensure_ascii=False, indent=2)[:5200])
+
+    text = "\n".join(lines)
+    return text[:5900]
 
 
 def pick_original_file_id(image_variants: list[dict[str, Any]]) -> str | None:
@@ -326,12 +396,227 @@ def _face_bbox_size(face: dict[str, Any]) -> dict[str, int] | None:
     return {"width_px": w, "height_px": h, "area_px2": w * h}
 
 
-def format_face_attributes(face: dict[str, Any]) -> str:
+def _parse_xy(p: Any) -> tuple[float, float] | None:
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        try:
+            return float(p[0]), float(p[1])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(p, dict):
+        for a, b in (("x", "y"), ("X", "Y")):
+            if a in p and b in p:
+                try:
+                    return float(p[a]), float(p[b])
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def _euclid_px(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _iso_images_list(iso_json: dict[str, Any]) -> list[dict[str, Any]]:
+    imgs = iso_json.get("images")
+    if isinstance(imgs, list) and imgs:
+        return imgs
+    alt = iso_json.get("images_estimations")
+    return alt if isinstance(alt, list) else []
+
+
+def eye_distance_px_from_check_iso(
+    iso_json: dict[str, Any],
+    *,
+    image_index: int = 0,
+    face_index: int = 0,
+) -> float | None:
+    """Расстояние между глазами из ответа checkISO: ``checks[]`` с ``name`` = ``eye_distance`` → ``object_value`` (px).
+
+    Ожидаемая ветка (v.5.152.0): ``images[i].estimations[j].face.detection.iso.checks``.
+    """
+    imgs = _iso_images_list(iso_json)
+    if image_index >= len(imgs):
+        return None
+    ests = imgs[image_index].get("estimations") if isinstance(imgs[image_index], dict) else None
+    if not isinstance(ests, list) or face_index >= len(ests):
+        return None
+    est = ests[face_index]
+    if not isinstance(est, dict):
+        return None
+
+    face = est.get("face")
+    if isinstance(face, dict):
+        det = face.get("detection")
+        if isinstance(det, dict):
+            iso = det.get("iso")
+            if isinstance(iso, dict):
+                checks = iso.get("checks")
+                if isinstance(checks, list):
+                    for ch in checks:
+                        if not isinstance(ch, dict):
+                            continue
+                        if ch.get("name") != "eye_distance":
+                            continue
+                        ov = ch.get("object_value")
+                        if isinstance(ov, (int, float)) and not isinstance(ov, bool) and float(ov) > 0:
+                            return float(ov)
+
+    def _walk_find_eye_distance(obj: Any, depth: int = 0) -> float | None:
+        if depth > 14:
+            return None
+        if isinstance(obj, dict):
+            if obj.get("name") == "eye_distance":
+                ov = obj.get("object_value")
+                if isinstance(ov, (int, float)) and not isinstance(ov, bool) and float(ov) > 0:
+                    return float(ov)
+            for v in obj.values():
+                d = _walk_find_eye_distance(v, depth + 1)
+                if d is not None:
+                    return d
+        elif isinstance(obj, list):
+            for x in obj:
+                d = _walk_find_eye_distance(x, depth + 1)
+                if d is not None:
+                    return d
+        return None
+
+    return _walk_find_eye_distance(est)
+
+
+def _inter_eye_from_iris_landmarks(raw_attrs: dict[str, Any]) -> float | None:
+    eyes = raw_attrs.get("eyes_attributes")
+    if not isinstance(eyes, dict):
+        eyes = {}
+    ilm = eyes.get("iris_landmarks")
+    if ilm is None:
+        ilm = raw_attrs.get("iris_landmarks")
+    if isinstance(ilm, dict):
+        for lk, rk in (
+            ("left", "right"),
+            ("left_iris", "right_iris"),
+            ("left_eye", "right_eye"),
+        ):
+            l, r = _parse_xy(ilm.get(lk)), _parse_xy(ilm.get(rk))
+            if l and r:
+                return _euclid_px(l, r)
+    if isinstance(ilm, list) and len(ilm) >= 2:
+        l, r = _parse_xy(ilm[0]), _parse_xy(ilm[1])
+        if l and r:
+            return _euclid_px(l, r)
+    return None
+
+
+def _centroid_points(lm: list[Any], indices: range) -> tuple[float, float] | None:
+    pts: list[tuple[float, float]] = []
+    for i in indices:
+        if i >= len(lm):
+            continue
+        p = _parse_xy(lm[i])
+        if p:
+            pts.append(p)
+    if not pts:
+        return None
+    sx = sum(p[0] for p in pts) / len(pts)
+    sy = sum(p[1] for p in pts) / len(pts)
+    return sx, sy
+
+
+def _inter_eye_from_face_landmarks(face: dict[str, Any]) -> float | None:
+    det = face.get("detection") or {}
+    lm = det.get("landmarks") or det.get("points")
+    if not isinstance(lm, list) or len(lm) < 4:
+        return None
+    # Раскладка как у 68-point: глаза — точки 36–41 и 42–47.
+    if len(lm) >= 48:
+        left = _centroid_points(lm, range(36, 42))
+        right = _centroid_points(lm, range(42, 48))
+        if left and right:
+            return _euclid_px(left, right)
+    if len(lm) == 2:
+        a, b = _parse_xy(lm[0]), _parse_xy(lm[1])
+        if a and b:
+            return _euclid_px(a, b)
+    return None
+
+
+def _inter_eye_distance_info(
+    face: dict[str, Any],
+    *,
+    iso_json: dict[str, Any] | None = None,
+    face_index: int = 0,
+) -> tuple[float, str] | None:
+    """Расстояние между центрами глаз в пикселях кадра и источник значения."""
+    if iso_json is not None:
+        d_iso = eye_distance_px_from_check_iso(iso_json, image_index=0, face_index=face_index)
+        if d_iso is not None:
+            return d_iso, "iso"
+
+    raw = _face_attrs(face)
+    eyes = raw.get("eyes_attributes") if isinstance(raw.get("eyes_attributes"), dict) else {}
+
+    def try_numeric(container: dict[str, Any]) -> float | None:
+        for key in (
+            "interocular_distance",
+            "inter_eye_distance",
+            "eye_distance",
+            "iod",
+            "interocular",
+            "pupillary_distance",
+        ):
+            v = container.get(key)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return None
+
+    if isinstance(eyes, dict):
+        d = try_numeric(eyes)
+        if d is not None:
+            return d, "sdk"
+        for nested in (eyes.get("geometry"), eyes.get("measurements"), eyes.get("sizes")):
+            if isinstance(nested, dict):
+                d = try_numeric(nested)
+                if d is not None:
+                    return d, "sdk"
+
+    if isinstance(raw, dict):
+        d = try_numeric(raw)
+        if d is not None:
+            return d, "sdk"
+
+    d = _inter_eye_from_iris_landmarks(raw)
+    if d is not None:
+        return d, "iris"
+
+    d = _inter_eye_from_face_landmarks(face)
+    if d is not None:
+        return d, "landmarks"
+
+    return None
+
+
+def format_face_attributes(
+    face: dict[str, Any],
+    *,
+    iso_json: dict[str, Any] | None = None,
+    face_index: int = 0,
+) -> str:
     attrs = _annotate_estimations(_without_iris_landmarks(_face_attrs(face)))
     parts: dict[str, Any] = {}
     size = _face_bbox_size(face)
     if size is not None:
         parts["📐 размер лица (bbox)"] = size
+    iei = _inter_eye_distance_info(face, iso_json=iso_json, face_index=face_index)
+    if iei is not None:
+        dist, src = iei
+        hint = {
+            "iso": "checkISO, проверка eye_distance (object_value), docs v.5.152.0",
+            "sdk": "оценка SDK (/sdk)",
+            "iris": "по iris_landmarks",
+            "landmarks": "по меткам лица (68-point)",
+        }[src]
+        parts["📏 расстояние между глазами"] = {"distance_px": round(dist, 2), "источник": hint}
     parts.update(
         {
         "👄 mouth_attributes": attrs.get("mouth_attributes"),

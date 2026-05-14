@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from typing import Any
@@ -331,7 +332,11 @@ async def _run_attributes(
 ) -> None:
     ct = _guess_image_content_type(image, content_type)
     try:
-        j = await luna.sdk_analyze(image, ct, ATTR_PARAMS)
+        j, iso_exc = await asyncio.gather(
+            luna.sdk_analyze(image, ct, ATTR_PARAMS),
+            luna.check_iso(image, ct, multiface_policy=2),
+            return_exceptions=True,
+        )
     except Exception as e:
         log.exception("sdk attr")
         await send_text(
@@ -340,6 +345,23 @@ async def _run_attributes(
             text=f"Ошибка SDK: {e}"[:3000],
         )
         return
+
+    if isinstance(j, Exception):
+        log.exception("sdk attr", exc_info=j)
+        await send_text(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            text=f"Ошибка SDK: {j}"[:3000],
+        )
+        return
+
+    iso_payload: dict[str, Any] | None = None
+    iso_text: str | None = None
+    if isinstance(iso_exc, Exception):
+        log.warning("check_iso: %s", iso_exc)
+    else:
+        iso_payload = iso_exc
+        iso_text = luna.format_iso_check_ru(iso_exc)
 
     faces = luna.iter_faces_from_sdk(j)
     if not faces:
@@ -350,11 +372,20 @@ async def _run_attributes(
         )
         return
 
+    if iso_text:
+        await send_text(
+            login=target.get("login"),
+            chat_id=target.get("chat_id"),
+            text=iso_text[:5900],
+        )
+
     for i, face in enumerate(faces):
         pict = draw.draw_boxes_on_image(
             image, [face], highlight_index=0, colors=[(64, 64, 255)]
         )
-        cap = f"👤 Лицо {i + 1} / {len(faces)}\n\n" + luna.format_face_attributes(face)
+        cap = f"👤 Лицо {i + 1} / {len(faces)}\n\n" + luna.format_face_attributes(
+            face, iso_json=iso_payload, face_index=i
+        )
         await send_image_bytes(
             login=target.get("login"),
             chat_id=target.get("chat_id"),
