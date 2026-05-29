@@ -289,6 +289,49 @@ _VALUE_HINTS: dict[str, dict[str, str]] = {
 }
 
 
+_GENDER_INT_HINTS: dict[int, str] = {
+    0: "женский",
+    1: "мужской",
+}
+
+
+def _gender_label(raw: Any) -> str | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int) and raw in _GENDER_INT_HINTS:
+        return f"{raw} ({_GENDER_INT_HINTS[raw]})"
+    if isinstance(raw, str):
+        hint = {
+            "female": "женский",
+            "male": "мужской",
+            "unknown": "неизвестно",
+        }.get(raw.lower())
+        return f"{raw} ({hint})" if hint else raw
+    return str(raw) if raw is not None else None
+
+
+def _basic_attributes_compact_for_caption(raw: dict[str, Any]) -> dict[str, Any]:
+    """Пол и возраст из basic_attributes (лицо или тело)."""
+    out: dict[str, Any] = {}
+    gender_raw = raw.get("gender")
+    if gender_raw is None:
+        gender_raw = raw.get("apparent_gender")
+    gender = _gender_label(gender_raw)
+    if gender is not None:
+        out["пол"] = gender
+
+    age_raw = raw.get("age")
+    if age_raw is None:
+        age_raw = raw.get("apparent_age")
+    if isinstance(age_raw, bool):
+        pass
+    elif isinstance(age_raw, (int, float)):
+        out["возраст"] = int(age_raw) if float(age_raw).is_integer() else round(float(age_raw), 1)
+    elif age_raw is not None:
+        out["возраст"] = age_raw
+    return out
+
+
 def _eyes_attributes_compact_for_caption(raw: dict[str, Any]) -> dict[str, Any]:
     """Только состояние глаз со скобкой-переводом, порядок: правый, левый (как в выдаче операторов)."""
     hints = _VALUE_HINTS.get("state", {})
@@ -605,8 +648,14 @@ def format_face_attributes(
         eyes_out = compact if compact else _annotate_estimations(eyes_raw)
     else:
         eyes_out = eyes_raw
+    basic_raw = attrs.get("basic_attributes")
+    basic_out: Any = None
+    if isinstance(basic_raw, dict):
+        compact_basic = _basic_attributes_compact_for_caption(basic_raw)
+        basic_out = compact_basic if compact_basic else _annotate_estimations(basic_raw)
     parts.update(
         {
+        "🪪 пол и возраст": basic_out,
         "👄 mouth_attributes": attrs.get("mouth_attributes"),
         "👀 eyes_attributes": eyes_out,
         "🙂 emotions": attrs.get("emotions"),
@@ -631,9 +680,14 @@ def format_face_attributes(
 def format_body_attributes(body: dict[str, Any]) -> str:
     det = body.get("detection") or {}
     attrs = _annotate_estimations(_without_iris_landmarks((det.get("attributes") or {})))
+    basic_raw = attrs.get("basic_attributes")
+    basic_out: Any = None
+    if isinstance(basic_raw, dict):
+        compact_basic = _basic_attributes_compact_for_caption(basic_raw)
+        basic_out = compact_basic if compact_basic else basic_raw
     parts = {
         "🧬 descriptor": (attrs.get("descriptor") or {}).get("score"),
-        "🪪 basic_attributes": attrs.get("basic_attributes"),
+        "🪪 пол и возраст": basic_out,
         "👕 upper_body": attrs.get("upper_body"),
         "👖 lower_body": attrs.get("lower_body"),
         "🎒 accessories": attrs.get("accessories"),

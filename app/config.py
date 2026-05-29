@@ -30,5 +30,8 @@ class Settings(BaseSettings):
     luna_http_password: str = ""
     luna_bearer_token: str = ""
 
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
+
 
 settings = Settings()

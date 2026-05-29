@@ -16,6 +16,10 @@ _ISSUE_RE = re.compile(r"^[!/]issue\s+(\S+)", re.IGNORECASE)
 _REVOKE_RE = re.compile(r"^[!/]revoke\s+(\S+)", re.IGNORECASE)
 
 
+def normalize_login(s: str) -> str:
+    return _norm_login(s)
+
+
 def _norm_login(s: str) -> str:
     return (s or "").strip().lower()
 

@@ -14,5 +14,31 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  web:
+    build: .
+    restart: unless-stopped
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "app.web_app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080",
+      ]
+    ports:
+      # Снаружи: 443 → nginx (TLS) → http://127.0.0.1:80 на хосте → контейнер :8080
+      # Только loopback, чтобы обход nginx по HTTP:80 с интернета был невозможен
+      - "127.0.0.1:${WEB_PUBLISH_PORT:-80}:8080"
+    env_file: .env
+    environment:
+      BOT_ACCESS_STORE: /data/access_auth/access_users.json
+    volumes:
+      - ./access_auth:/data/access_auth
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   bot_state:

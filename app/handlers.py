@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections import deque
 from typing import Any
 
 from app import access_control
+from app import pipeline
 from app.config import settings
-from app import luna, draw
 from app.state import Flow, get_session, session_key
 from app.url_images import extract_urls, fetch_image_from_url
 from app.yandex_api import (
@@ -21,94 +20,6 @@ log = logging.getLogger(__name__)
 
 SEEN: deque[int] = deque(maxlen=20000)
 SEEN_SET: set[int] = set()
-
-COMPARE_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 2,
-    "detect_face": 1,
-    "detect_body": 0,
-    "estimate_face_descriptor": 1,
-    "score_threshold": 0.5,
-}
-
-ATTR_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 1,
-    "detect_face": 1,
-    "detect_body": 0,
-    "estimate_head_pose": 1,
-    "estimate_emotions": 1,
-    "estimate_mask": 1,
-    "estimate_glasses": 1,
-    "estimate_eyes_attributes": 1,
-    "estimate_mouth_attributes": 1,
-    "estimate_face_occlusion": 1,
-    "score_threshold": 0.5,
-}
-
-BODY_ATTR_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 1,
-    "detect_face": 0,
-    "detect_body": 1,
-    "estimate_body_descriptor": 1,
-    "estimate_body_basic_attributes": 1,
-    "estimate_upper_body": 1,
-    "estimate_lower_body": 1,
-    "estimate_accessories": 1,
-    "score_threshold": 0.5,
-}
-
-LIVENESS_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 2,
-    "detect_face": 1,
-    "detect_body": 0,
-    "estimate_liveness": 1,
-    "score_threshold": 0.5,
-}
-
-DEEPFAKE_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 2,
-    "detect_face": 1,
-    "detect_body": 0,
-    "estimate_deepfake": 1,
-    "score_threshold": 0.5,
-}
-
-QUALITY_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 2,
-    "detect_face": 1,
-    "detect_body": 0,
-    "estimate_quality": 1,
-    "score_threshold": 0.5,
-}
-
-FACE_DETECT_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 1,
-    "detect_face": 1,
-    "detect_body": 0,
-    "score_threshold": 0.5,
-}
-
-BODY_DETECT_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 1,
-    "detect_face": 0,
-    "detect_body": 1,
-    "score_threshold": 0.5,
-}
-
-IMAGE_MODIFICATION_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 0,
-    "detect_face": 0,
-    "detect_body": 0,
-    "estimate_image_modification": 1,
-    "score_threshold": 0.5,
-}
-
-CROWD_DETECT_PARAMS: dict[str, int | float] = {
-    "multiface_policy": 1,
-    "detect_face": 0,
-    "detect_body": 0,
-    "estimate_people_count": 1,
-    "people_count_coordinates": 1,
-}
 
 
 def _principal(update: dict[str, Any]) -> str | None:
@@ -207,11 +118,13 @@ def _extract_server_action(update: dict[str, Any]) -> tuple[str | None, dict[str
 
 
 def _gallery_file_ids(update: dict[str, Any]) -> list[str]:
+    from app import luna as luna_mod
+
     out: list[str] = []
     for group in update.get("images") or []:
         if not group:
             continue
-        fid = luna.pick_original_file_id(group)
+        fid = luna_mod.pick_original_file_id(group)
         if fid:
             out.append(fid)
     return out
@@ -228,464 +141,83 @@ def _seen(u: int) -> bool:
     return False
 
 
-def _similarity_percent(match_json: dict[str, Any]) -> float | None:
-    try:
-        m = match_json["matches"][0]["matches"][0]["similarity"]
-        return float(m) * 100.0
-    except (KeyError, IndexError, TypeError, ValueError):
-        return None
-
-
-def _guess_image_content_type(data: bytes, reported: str) -> str:
-    r = (reported or "").split(";")[0].strip().lower()
-    if r.startswith("image/") and r != "image/octet-stream":
-        return r
-    if data[:2] == b"\xff\xd8":
-        return "image/jpeg"
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return "image/png"
-    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/jpeg"
+async def _emit_bundle(target: dict[str, str | None], bundle: pipeline.BotBundle) -> None:
+    login, chat_id = target.get("login"), target.get("chat_id")
+    for p in bundle.parts:
+        if isinstance(p, pipeline.PipeText):
+            await send_text(login=login, chat_id=chat_id, text=p.text)
+        else:
+            await send_image_bytes(
+                login=login,
+                chat_id=chat_id,
+                image_bytes=p.data,
+                caption=p.caption,
+                filename=p.filename,
+            )
+    if bundle.menu_message:
+        await _reply_menu(bundle.menu_message, target)
 
 
 async def _run_compare(
     target: dict[str, str | None],
     images: list[tuple[bytes, str]],
 ) -> None:
-    if len(images) < 2:
-        await _reply_menu("Нужно два снимка.", target)
-        return
-    (a, cta), (b, ctb) = images[0], images[1]
-    cta = _guess_image_content_type(a, cta)
-    ctb = _guess_image_content_type(b, ctb)
-    try:
-        ja = await luna.sdk_analyze(a, cta, COMPARE_PARAMS)
-        jb = await luna.sdk_analyze(b, ctb, COMPARE_PARAMS)
-    except Exception as e:
-        log.exception("sdk compare")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    fa = luna.iter_faces_from_sdk(ja)
-    fb = luna.iter_faces_from_sdk(jb)
-    if not fa or not fb:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="На одном из снимков лицо не найдено. Пришлите другое фото.",
-        )
-        return
-
-    d0 = luna.get_descriptor_b64(fa[0])
-    d1 = luna.get_descriptor_b64(fb[0])
-    if not d0 or not d1:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="Не удалось извлечь дескриптор (face descriptor).",
-        )
-        return
-
-    try:
-        mraw = await luna.matcher_raw_sdk(d0, d1)
-    except Exception as e:
-        log.exception("matcher")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка matcher/raw: {e}"[:3000],
-        )
-        return
-
-    pct = _similarity_percent(mraw)
-    out_a = draw.draw_boxes_on_image(a, [fa[0]], highlight_index=0, colors=[(255, 0, 0)])
-    out_b = draw.draw_boxes_on_image(b, [fb[0]], highlight_index=0, colors=[(0, 180, 0)])
-    sim_text = f"🧑‍🤝‍🧑 Схожесть: {pct:.2f}%" if pct is not None else "🧑‍🤝‍🧑 Схожесть: (нет в ответе matcher)"
-    await send_text(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        text=sim_text,
-    )
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=out_a,
-        filename="face_a.jpg",
-    )
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=out_b,
-        filename="face_b.jpg",
-    )
-    await _reply_menu("✅ Готово. Можно выбрать следующее действие.", target)
+    bundle = await pipeline.run_compare(images)
+    await _emit_bundle(target, bundle)
 
 
 async def _run_attributes(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j, iso_exc = await asyncio.gather(
-            luna.sdk_analyze(image, ct, ATTR_PARAMS),
-            luna.check_iso(image, ct, multiface_policy=2),
-            return_exceptions=True,
-        )
-    except Exception as e:
-        log.exception("sdk attr")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    if isinstance(j, Exception):
-        log.exception("sdk attr", exc_info=j)
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {j}"[:3000],
-        )
-        return
-
-    iso_payload: dict[str, Any] | None = None
-    if isinstance(iso_exc, Exception):
-        log.warning("check_iso: %s", iso_exc)
-    else:
-        iso_payload = iso_exc
-
-    faces = luna.iter_faces_from_sdk(j)
-    if not faces:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="👤 Лица не обнаружены.",
-        )
-        return
-
-    for i, face in enumerate(faces):
-        pict = draw.draw_boxes_on_image(
-            image, [face], highlight_index=0, colors=[(64, 64, 255)]
-        )
-        cap = f"👤 Лицо {i + 1} / {len(faces)}\n\n" + luna.format_face_attributes(
-            face, iso_json=iso_payload, face_index=i
-        )
-        await send_image_bytes(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            image_bytes=pict,
-            caption=cap,
-            filename=f"face_{i+1}.jpg",
-        )
-    await _reply_menu("✅ Атрибуты отправлены.", target)
+    await _emit_bundle(target, await pipeline.run_attributes(image, content_type))
 
 
 async def _run_body_attributes(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, BODY_ATTR_PARAMS)
-    except Exception as e:
-        log.exception("sdk body attrs")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    bodies = luna.iter_bodies_from_sdk(j)
-    if not bodies:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="🧍 Тела не обнаружены.",
-        )
-        return
-
-    for i, body in enumerate(bodies):
-        pict = draw.draw_boxes_on_image(
-            image, [body], highlight_index=0, colors=[(0, 200, 140)]
-        )
-        cap = f"🧍 Тело {i + 1} / {len(bodies)}\n\n" + luna.format_body_attributes(body)
-        await send_image_bytes(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            image_bytes=pict,
-            caption=cap,
-            filename=f"body_{i+1}.jpg",
-        )
-    await _reply_menu("✅ Атрибуты тела отправлены.", target)
+    await _emit_bundle(target, await pipeline.run_body_attributes(image, content_type))
 
 
 async def _run_liveness(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, LIVENESS_PARAMS)
-    except Exception as e:
-        log.exception("sdk liveness")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    faces = luna.iter_faces_from_sdk(j)
-    if not faces:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="👤 Лицо не обнаружено — нужен снимок с лицом.",
-        )
-        return
-
-    face = faces[0]
-    pict = draw.draw_boxes_on_image(image, [face], highlight_index=0, colors=[(200, 100, 0)])
-    cap = "🫀 Liveness (лучшее лицо на кадре)\n\n" + luna.format_liveness(face)
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=pict,
-        caption=cap,
-        filename="liveness.jpg",
-    )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_liveness(image, content_type))
 
 
 async def _run_deepfake(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, DEEPFAKE_PARAMS)
-    except Exception as e:
-        log.exception("sdk deepfake")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    faces = luna.iter_faces_from_sdk(j)
-    if not faces:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="👤 Лицо не обнаружено — нужен снимок с лицом.",
-        )
-        return
-
-    face = faces[0]
-    pict = draw.draw_boxes_on_image(image, [face], highlight_index=0, colors=[(160, 60, 200)])
-    cap = "🎭 Дипфейк (лучшее лицо на кадре)\n\n" + luna.format_deepfake(face)
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=pict,
-        caption=cap,
-        filename="deepfake.jpg",
-    )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_deepfake(image, content_type))
 
 
 async def _run_quality(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, QUALITY_PARAMS)
-    except Exception as e:
-        log.exception("sdk quality")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    faces = luna.iter_faces_from_sdk(j)
-    if not faces:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="👤 Лицо не обнаружено — нужен снимок с лицом.",
-        )
-        return
-
-    face = faces[0]
-    pict = draw.draw_boxes_on_image(image, [face], highlight_index=0, colors=[(80, 160, 255)])
-    cap = luna.format_quality_ru(j)
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=pict,
-        caption=cap,
-        filename="quality.jpg",
-    )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_quality(image, content_type))
 
 
 async def _run_face_detect(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, FACE_DETECT_PARAMS)
-    except Exception as e:
-        log.exception("sdk face_detect")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    faces = luna.iter_faces_from_sdk(j)
-    if not faces:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="👥 Лица на кадре не найдены.",
-        )
-        await _reply_menu("✅ Готово.", target)
-        return
-
-    for i, face in enumerate(faces):
-        pict = draw.draw_boxes_on_image(
-            image,
-            [face],
-            highlight_index=0,
-            colors=[(255, 60, 60)],
-            line_width=3,
-        )
-        cap = f"👥 Детекция лиц — лицо {i + 1} из {len(faces)}."
-        await send_image_bytes(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            image_bytes=pict,
-            caption=cap,
-            filename=f"face_detect_{i+1}.jpg",
-        )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_face_detect(image, content_type))
 
 
 async def _run_body_detect(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, BODY_DETECT_PARAMS)
-    except Exception as e:
-        log.exception("sdk body_detect")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    bodies = luna.iter_bodies_from_sdk(j)
-    if not bodies:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="🧍 Тела на кадре не найдены.",
-        )
-        await _reply_menu("✅ Готово.", target)
-        return
-
-    for i, body in enumerate(bodies):
-        pict = draw.draw_boxes_on_image(
-            image,
-            [body],
-            highlight_index=0,
-            colors=[(0, 200, 140)],
-            line_width=3,
-        )
-        cap = f"🧍 Детекция тел — тело {i + 1} из {len(bodies)}."
-        await send_image_bytes(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            image_bytes=pict,
-            caption=cap,
-            filename=f"body_detect_{i+1}.jpg",
-        )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_body_detect(image, content_type))
 
 
 async def _run_image_modification(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, IMAGE_MODIFICATION_PARAMS)
-    except Exception as e:
-        log.exception("sdk image_modification")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    text = luna.format_image_modification_ru(j)
-    await send_text(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        text=text[:5900],
-    )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_image_modification(image, content_type))
 
 
 async def _run_crowd_detect(
     target: dict[str, str | None], image: bytes, content_type: str = "image/jpeg"
 ) -> None:
-    ct = _guess_image_content_type(image, content_type)
-    try:
-        j = await luna.sdk_analyze(image, ct, CROWD_DETECT_PARAMS)
-    except Exception as e:
-        log.exception("sdk crowd_detect")
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text=f"Ошибка SDK: {e}"[:3000],
-        )
-        return
-
-    count, points = luna.get_people_estimation(j)
-    if count is None and not points:
-        await send_text(
-            login=target.get("login"),
-            chat_id=target.get("chat_id"),
-            text="🧑‍🤝‍🧑 Детекция толпы: блок people не вернулся.",
-        )
-        await _reply_menu("✅ Готово.", target)
-        return
-
-    out = draw.draw_people_points_on_image(image, points) if points else image
-    c = count if count is not None else len(points)
-    cap = f"🧑‍🤝‍🧑 Детекция толпы: людей на кадре — {c}."
-    if points and (count is None or count != len(points)):
-        cap += f" Точек: {len(points)}."
-    await send_image_bytes(
-        login=target.get("login"),
-        chat_id=target.get("chat_id"),
-        image_bytes=out,
-        caption=cap,
-        filename="crowd_detect.jpg",
-    )
-    await _reply_menu("✅ Готово.", target)
+    await _emit_bundle(target, await pipeline.run_crowd_detect(image, content_type))
 
 
 async def handle_update(update: dict[str, Any]) -> None:
